@@ -157,7 +157,6 @@
     <ClCompile Include="CentralCache.cpp" />
     <ClCompile Include="PageCache.cpp" />
     <ClCompile Include="ThreadCache.cpp" />
-    <ClCompile Include="UnitTest.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

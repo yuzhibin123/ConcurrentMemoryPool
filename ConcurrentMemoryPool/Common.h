@@ -1,85 +1,97 @@
 #pragma once
-
 #include <iostream>
 #include <assert.h>
-#include <unordered_map>
-#include <map>
 #include <thread>
 #include <mutex>
 #include <vector>
-#include <stdlib.h>
-#include <algorithm>
+#include <unordered_map>
+
 
 #ifdef _WIN32
 #include <windows.h>
-#endif  //_WIN32
+#endif // _WIN32
 
-//using namespace std;
-using std::endl;
-using std::cout;
 
-const size_t MAX_BYTES = 64 * 1024;  //ThreadCache申请的最大内存
-const size_t NLISTS = 184;  //数组元素总的有多少个，由对齐规则计算得来
+//管理自由链表数组的长度
+const size_t NLISTS = 240;
+//最大可以一次分配多大的内存64K
+const size_t MAXBYTES = 64 * 1024;
+//对于一页是4096byte，12就是2的次方
+const size_t PAGE_SHIFT = 12;
+//对于PageCache的最大可以存放NPAGES页
 const size_t NPAGES = 129;
-const size_t PAGE_SHIFT = 12;  //4K为页移位
 
-inline static void*& NEXT_OBJ(void* obj)  //抢取对象头四个或者头八个字节，void*的别名，本身是内存，只能我们自己取
+static inline void* SystemAlloc(size_t npage)
 {
-	return *((void**)obj);  //先强制转为void**，然后解引用就是一个void*
+#ifdef _WIN32
+	//到这里也就是，PageCache里面也没有大于申请的npage的页，要去系统申请内存
+	//对于从系统申请内存，一次申请128页的内存，这样的话，提高效率，一次申请够不需要频繁申请
+	void* ptr = VirtualAlloc(NULL, (NPAGES - 1) << PAGE_SHIFT, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+	if (ptr == nullptr)
+	{
+		throw std::bad_alloc();
+	}
+
+	return ptr;
+#else 
+	//Linux下
+
+#endif //_WIN32
 }
 
-//设置一个公共的FreeList对象链表，每个对象中含有各个接口，到时候直接使用接口进行操作
-//让一个类来管理自由链表
-class Freelist
+static inline void SystemFree(void* ptr)
 {
-private:
-	void* _list = nullptr;  //给上缺省值
-	size_t _size = 0;  //自由链表下挂的个数,记录有多少个对象
-	size_t _maxsize = 1;
+#ifdef _WIN32
+	//到这里也就是，PageCache里面也没有大于申请的npage的页，要去系统申请内存
+	//对于从系统申请内存，一次申请128页的内存，这样的话，提高效率，一次申请够不需要频繁申请
+	VirtualFree(ptr, 0, MEM_RELEASE);
+	if (ptr == nullptr)
+	{
+		throw std::bad_alloc();
+	}
+#else 
+#endif //_WIN32
+}
 
+static inline void*& NEXT_OBJ(void* obj)
+{
+	return *((void**)obj);
+}
+
+//自由链表
+class FreeList
+{
 public:
-	void Push(void* obj)
-	{
-		//头插
-		NEXT_OBJ(obj) = _list;
-		_list = obj;
-		++_size;
-	}
-
-	void* Pop()  //把对象弹出去
-	{
-		//头删
-		void* obj = _list;
-		_list = NEXT_OBJ(obj);
-		--_size;
-		return obj;
-	}
-
-	//插入到自由链表中
-	void PushRange(void* start, void* end, size_t n)
-	{
-		NEXT_OBJ(end) = _list;
-		_list = start;
-		_size += n;
-	}
-
-	//从自由链表中取走内存对象
-	void* PopRange()
-	{
-		_size = 0;
-		void* list = _list;
-		_list = nullptr;
-		return list;
-	}
-
-	size_t Size()
-	{
-		return _size;
-	}
-
 	bool Empty()
 	{
 		return _list == nullptr;
+	}
+
+	void PushRange(void* start, void* end, size_t num)
+	{
+		//_list->start->end->_list
+		//将这一段内存添加到自由链表当中，并且对于该段自由链表的内存块数量进行增加
+		NEXT_OBJ(end) = _list;
+		_list = start;
+		_size += num;
+	}
+
+	//头删
+	void* Pop()
+	{
+		void* obj = _list;
+		_list = NEXT_OBJ(obj);
+		_size--;
+
+		return obj;
+	}
+
+	//头插
+	void Push(void* ptr)
+	{
+		NEXT_OBJ(ptr) = _list;
+		_list = ptr;
+		_size++;
 	}
 
 	size_t MaxSize()
@@ -87,242 +99,254 @@ public:
 		return _maxsize;
 	}
 
-	void SetMaxSize(size_t maxsize)
+	void SetMaxSize(size_t num)
 	{
-		_maxsize = maxsize;
+		_maxsize = num;
 	}
 
+	size_t Size()
+	{
+		return _size;
+	}
+
+	void* Clear()
+	{
+		_size = 0;
+		void* list = _list;
+		_list = nullptr;
+
+		return list;
+	}
+
+private:
+	void* _list = nullptr;//形成一个自由链表
+	size_t _size = 0;//有多少个内存结点
+	size_t _maxsize = 1;//最多有多少个内存结点，作用：水位线，自由链表当中现在有多少内存块
 };
 
-//专门用来计算大小位置的类
-class SizeClass
+//对于span是为了对于thread cache还回来的内存进行管理，
+//一个span中包含了内存块
+typedef size_t PageID;
+struct Span
+{
+	PageID _pageid = 0; //页号
+	size_t _npage = 0; //页的数量
+	Span* _next = nullptr;
+	Span* _prev = nullptr;
+
+	void* _objlist = nullptr; //对象自由链表
+	size_t _objsize = 0;	//记录该span上的内存块的大小,作用：用来对于使用的时候计算，内存块的大小
+	size_t _usecount = 0; //使用计数，计算使用了多少内存块
+};
+
+//跨度链表
+class SpanList
 {
 public:
-	//获取Freelist的位置
-	inline static size_t _Index(size_t size, size_t align)
+	//双向循环带头结点链表
+	SpanList()
 	{
-		size_t alignnum = 1 << align;  //库里实现的方式
-		return ((size + alignnum - 1) >> align) - 1;
+		_head = new Span;
+		_head->_next = _head;
+		_head->_prev = _head;
 	}
 
-	inline static size_t _Roundup(size_t size, size_t align)
+	Span* begin()
 	{
-		size_t alignnum = 1 << align;
-		return (size + alignnum - 1)&~(alignnum - 1);
+		return _head->_next;
 	}
-	//  [9-16] +7 = [16-23] -> 16 8 4 2 1
-	//  [17-32] + 15 = [32,47] -> 32 16 8 4 2 1
 
+	Span* end()
+	{
+		return _head;
+	}
+
+	bool Empty()
+	{
+		return _head == _head->_next;
+	}
+
+	void Insert(Span* cur, Span* newspan)
+	{
+		assert(cur);
+		Span* prev = cur->_prev;
+
+		//prev newspan cur
+		prev->_next = newspan;
+		newspan->_prev = prev;
+		newspan->_next = cur;
+		cur->_prev = newspan;
+	}
+
+	void Erase(Span* cur)
+	{
+		assert(cur != nullptr && cur != _head);
+
+		Span* prev = cur->_prev;
+		Span* next = cur->_next;
+
+		prev->_next = next;
+		next->_prev = prev;
+	}
+
+	void PushBack(Span* cur)
+	{
+		Insert(end(), cur);
+	}
+
+	void PopBack()
+	{
+		Span* span = end();
+		Erase(span);
+	}
+
+	void PushFront(Span* cur)
+	{
+		Insert(begin(), cur);
+	}
+
+	Span* PopFront()
+	{
+		//必须要使用sapn来接收一下开始，因为删除之后再次使用begin()返回的话，就会返回刚才删除的下一个
+		//会出错，不是删除的那个一个了
+		Span* span = begin();
+		Erase(span);
+
+		return span;
+	}
+
+	//为了给每一个桶加锁
+	std::mutex _mtx;
+private:
+	Span * _head = nullptr;
+};
+
+class ClassSize
+{
 public:
-	//  控制在[1%, 10%]左右的内碎片浪费,另一种说法为12%
-	//  [1,128]  8byte对齐  freelist[0,16)
-	//  [129,1024]  16byte对齐  freelist[16,72)
-	//  [1025,8*1024]  128byte对齐  freelist[72,128)
-	//  [8*1024+1,64*1024]  1024byte对齐  freelist[128,1024)
-	
-	inline static size_t Index(size_t size)
+	//align是对齐数
+	static inline size_t _RoundUp(size_t size, size_t align)
 	{
-		assert(size <= MAX_BYTES);
+		//比如size是15 < 128,对齐数align是8，那么要进行向上取整，
+		//((15 + 7) / 8) * 8就可以了
+		//这个式子就是将(align - 1)加上去，这样的话就可以进一个对齐数了
+		//然后再将加上去的二进制的低三位设置为0，也就是向上取整了
+		//15 + 7 = 22 : 10110 (16 + 4 + 2)
+		//7 : 111 ~7 : 000
+		//22 & ~7 : 10000 (16)就达到了向上取整的效果
+		return (size + align - 1) & ~(align - 1);
+	}
 
-		//每个区间有多少个链
-		static int group_array[4] = { 16,56,56,56 };
+	//向上取整
+	static inline size_t RoundUp(size_t size)
+	{
+		assert(size <= MAXBYTES);
+
 		if (size <= 128)
 		{
-			return _Index(size, 3);
+			return _RoundUp(size, 8);
 		}
-		else if (size <= 1024)
+		if (size <= 8 * 128)
 		{
-			return _Index(size - 128, 4) + group_array[0];
+			return _RoundUp(size, 16);
 		}
-		else if (size <= 8192)
+		if (size <= 8 * 1024)
 		{
-			return _Index(size - 1024, 7) + group_array[0] + group_array[1];
+			return _RoundUp(size, 128);
 		}
-		else //if(size<=65536)
+		if (size <= 64 * 1024)
 		{
-			return _Index(size - 8 * 1024, 10) + group_array[0] + group_array[1] + group_array[2];
+			return _RoundUp(size, 512);
+		}
+		else
+		{
+			return -1;
 		}
 	}
 
-	//对齐大小计算，向上取整
-	static inline size_t Roundup(size_t bytes)
+	//控制内碎片在12%左右的浪费
+	//[1, 128]						8byte对齐		freelist[0,16)
+	//[129, 1024]					16byte对齐		freelist[17, 72)
+	//[1025, 8 * 1024]				64byte对齐		freelist[72, 128)
+	//[8 * 1024 + 1, 64 * 1024]		512byte对齐		freelist[128, 240)
+	//也就是说对于自由链表数组只需要开辟240个空间就可以了
+
+	//求出在该区间的第几个
+	static size_t _Index(size_t bytes, size_t align_shift)
 	{
-		assert(bytes <= MAX_BYTES);
+		//对于(1 << align_sjift)相当于求出对齐数
+		//给bytes加上对齐数减一也就是，让其可以跨越到下一个自由链表的数组的元素中
+		return ((bytes + (1 << align_shift) - 1) >> align_shift) - 1;
+	}
+
+	//获取自由链表的下标
+	static inline size_t Index(size_t bytes)
+	{
+		//开辟的字节数，必须小于可以开辟的最大的字节数
+		assert(bytes < MAXBYTES);
+
+		//每个对齐区间中，有着多少条自由链表
+		static int group_array[4] = { 16, 56, 56, 112 };
 
 		if (bytes <= 128)
 		{
-			return _Roundup(bytes, 3);
+			return _Index(bytes, 3);
 		}
-		else if (bytes <= 1024)
+		else if (bytes <= 1024) //(8 * 128)
 		{
-			return _Roundup(bytes, 4);
+			return _Index(bytes - 128, 4) + group_array[0];
 		}
-		else if (bytes <= 1024)
+		else if (bytes <= 4096) //(8 * 8 * 128)
 		{
-			return _Roundup(bytes, 7);
+			return _Index(bytes - 1024, 7) + group_array[1] + group_array[0];
 		}
-		else  //if(bytes<=65536)
+		else if (bytes <= 8 * 128)
 		{
-			return _Roundup(bytes, 10);
+			return _Index(bytes - 4096, 9) + group_array[2] + group_array[1] + group_array[0];
+		}
+		else
+		{
+			return -1;
 		}
 	}
 
-	//动态计算从中心缓存分配多少个内存对象到ThreadCache中
-	static size_t NumMoveSize(size_t size)
+	//对于不同的byte获取不一样数量的内存
+	static inline size_t NumMoveSize(size_t size)
 	{
 		if (size == 0)
+		{
 			return 0;
+		}
 
-		int num = (int)(MAX_BYTES / size);
+		int num = (int)(MAXBYTES / size);
+		//当申请的size是64K的时候，就一次申请64K * 2
 		if (num < 2)
+		{
 			num = 2;
-
-		if (num > 512)
+		}
+		//当申请的size是8byte的时候，就一次申请512 * 8byte
+		if (num >= 512)
+		{
 			num = 512;
+		}
 
 		return num;
 	}
 
-	//根据size计算中心缓存要从页缓存获取多大的span对象
-	static size_t NumMovePage(size_t size)
+	//计算要获取几页
+	static inline size_t NumMovePage(size_t size)
 	{
 		size_t num = NumMoveSize(size);
-		size_t npage = num*size;
-		npage >>= PAGE_SHIFT;
+		size_t npage = (num * size) >> PAGE_SHIFT;
+
+		//如果申请的内存是0byte的话，计算下来就会申请0页
+		//我们对其进行处理当申请的内存是0byte的时候，我们就申请一页的内存
 		if (npage == 0)
+		{
 			npage = 1;
+		}
+
 		return npage;
 	}
+
 };
-
-#ifdef _WIN32
-  typedef size_t PageID;
-#else
-  typedef long long PageID;
-#endif  //_WIN32
-
-//Span是一个跨度，既可以分配内存出去，也是负责将内存回收回来到PageCache合并
-//是一个链式结构，定义为结构体就行，避免需要很多的友元
-  struct Span
-  {
-	  PageID _pageid = 0;  //页号
-	  size_t _npage = 0;  //页数
-
-	  Span* _prev = nullptr;
-	  Span* _next = nullptr;
-
-	  void* _list = nullptr;  //链接对象的自由链表，后面有对象就不为空，没有对象就是空
-	  size_t _objsize = 0;  //对象的大小
-
-	  size_t _usecount = 0;  //对象使用计数
-  };
-
-  //和上面的Freelist一样，各个接口自己实现，双向带头循环的Span链表
-  class SpanList
-  {
-  public:
-	  Span* _head;
-	  std::mutex _mutex;
-
-  public:
-	  SpanList()
-	  {
-		  _head = new Span;
-		  _head->_next = _head;
-		  _head->_prev = _head;
-	  }
-
-	  ~SpanList()  //释放链表的每个节点
-	  {
-		  Span * cur = _head->_next;
-		  while (cur != _head)
-		  {
-			  Span* next = cur->_next;
-			  delete cur;
-			  cur = next;
-		  }
-		  delete _head;
-		  _head = nullptr;
-	  }
-
-	  //防止拷贝构造和赋值构造，将其封死，没有拷贝的必要，不然就自己会实现浅拷贝
-	  SpanList(const SpanList&) = delete;
-	  SpanList& operator=(const SpanList&) = delete;
-
-	  //左闭右开
-	  Span* Begin()  //返回的一个数据的指针
-	  {
-		  return _head->_next;
-	  }
-
-	  Span* End()  //最后一个的下一个指针
-	  {
-		  return _head;
-	  }
-
-	  bool Empty()
-	  {
-		  return _head->_next == _head;
-	  }
-
-	  //在pos位置的前面插入一个newspan
-	  void Insert(Span* cur, Span* newspan)
-	  {
-		  Span* prev = cur->_prev;
-
-		  //prev newspan cur
-		  prev->_next = newspan;
-		  newspan->_next = cur;
-
-		  newspan->_prev = prev;
-		  cur->_prev = newspan;
-	  }
-
-	  //删除pos位置的节点
-	  void Erase(Span* cur)  //此处只是单纯的把pos拿出来，并没有释放掉，后面还有用处
-	  {
-		  Span* prev = cur->_prev;
-		  Span* next = cur->_next;
-
-		  prev->_next = next;
-		  next->_prev = prev;
-	  }
-
-	  //尾插
-	  void PushBack(Span* newspan)
-	  {
-		  Insert(End(), newspan);
-	  }
-
-	  //头插
-	  void PushFront(Span* newspan)
-	  {
-		  Insert(Begin(), newspan);
-	  }
-
-	  //尾删
-	  Span* PopBack()  //实际是将尾部位置的节点拿出来
-	  {
-		  Span* span = _head->_prev;
-		  Erase(span);
-		  return span;
-	  }
-
-	  //头删
-	  Span* PopFront()  //实际是将头部位置节点拿出来
-	  {
-		  Span* span = _head->_next;
-		  Erase(span);
-		  return span;
-	  }
-
-	  void Lock()
-	  {
-		  _mutex.lock();
-	  }
-
-	  void Unlock()
-	  {
-		  _mutex.unlock();
-	  }
-  };

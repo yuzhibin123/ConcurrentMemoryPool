@@ -1,40 +1,55 @@
 #pragma once
-#include"Common.h"
+#include "Common.h"
 #include "ThreadCache.h"
 #include "PageCache.h"
 
-//被动调用，哪个线程来了之后，需要内存就调用这个接口
-static inline void* ConcurrentAlloc(size_t size)
+void* ConcurrentAlloc(size_t size)
 {
-	if (size > MAX_BYTES)  //超过一个最大值64K，就自己从系统中获取，否则使用内存池
+	if (size > MAXBYTES)
 	{
-		//return malloc(size);
-		Span* span = PageCache::GetInstence()->AllocBigPageObj(size);
+		//大于64K，小于128页，就到PageCache中申请内存
+		size_t roundsize = ClassSize::_RoundUp(size, 1 << PAGE_SHIFT);
+		size_t npage = roundsize >> PAGE_SHIFT;
+		Span* span = PageCache::GetInstance()->NewSpan(npage);
 		void* ptr = (void*)(span->_pageid << PAGE_SHIFT);
+
 		return ptr;
+
+		//大于64K直接malloc
+		//return malloc(size);
 	}
+	//在64K之内直接在线程缓存中申请内存
 	else
 	{
-		if (tlslist == nullptr)  //第一次来，自己创建，后面来的，就可以直接使用当前创建好的内存池
+		//通过tls，获取线程自己的tls
+		if (tls_threadcache == nullptr)
 		{
-			tlslist = new ThreadCache;
+			tls_threadcache = new ThreadCache;
+			//std::cout << std::this_thread::get_id() << "->"  << tls_threadcache << std::endl;
+			//std::cout << tls_threadcache << std::endl;
 		}
 
-		return tlslist->Allocate(size);
+		//返回获取的内存块的地址
+		return tls_threadcache->Allocate(size);
+		//return nullptr;
 	}
 }
 
-static inline void ConcurrentFree(void* ptr)  //最后释放
+//将获取到的内存块归还给自由链表
+void ConcurrentFree(void* ptr)
 {
-	Span* span = PageCache::GetInstence()->MapObjectToSpan(ptr);
+
+	Span* span = PageCache::GetInstance()->MapObjectToSpan(ptr);
 	size_t size = span->_objsize;
-	if (size > MAX_BYTES)
+	//拿出这个要释放的内存块的大小，来判断要进行何种释放
+	//是大于64K的还是小于64K的
+	if (size > MAXBYTES)
 	{
-		//free(ptr);
-		PageCache::GetInstence()->FreeBigPageObj(ptr, span);
+		//大于64K
+		PageCache::GetInstance()->RelaseToPageCache(span);
 	}
 	else
 	{
-		tlslist->Deallocate(ptr, size);
+		return tls_threadcache->Deallocate(ptr, size);
 	}
 }
